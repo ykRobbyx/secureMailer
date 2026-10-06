@@ -1,4 +1,6 @@
 import smtplib
+import ssl
+import mimetypes
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -39,172 +41,138 @@ def create_default_config():
     logger.info("Please update the config file with your email settings")
 
 def load_config():
-    """Load configuration from file"""
+    """Load and validate configuration; raise ValueError for invalid settings."""
     if not os.path.exists(CONFIG_FILE):
         create_default_config()
-        logger.info("Please edit the config file with your email settings and run the script again.")
-        sys.exit(1)
-        
-    config = configparser.ConfigParser()
-    config.read(CONFIG_FILE)
-    
-    # Verify required config settings exist
-    required_keys = ['SENDER_EMAIL', 'SMTP_SERVER', 'SMTP_PORT']
-    for key in required_keys:
-        if key not in config['EMAIL']:
-            logger.error(f"Missing required configuration: {key}")
-            logger.info("Please check your config file and add all required settings.")
-            sys.exit(1)
-    
+        raise ValueError("Edit the new config file with your email settings and run again.")
+
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(CONFIG_FILE) as configfile:
+            config.read_file(configfile)
+        if 'EMAIL' not in config:
+            raise ValueError("Missing EMAIL configuration section")
+        settings = config['EMAIL']
+        for key in ('SENDER_EMAIL', 'SMTP_SERVER', 'SMTP_PORT'):
+            if not settings.get(key, '').strip():
+                raise ValueError("Missing required configuration: " + key)
+        port = settings.getint('SMTP_PORT')
+        if not 1 <= port <= 65535:
+            raise ValueError("SMTP_PORT must be between 1 and 65535")
+        if not is_valid_email(settings['SENDER_EMAIL']):
+            raise ValueError("SENDER_EMAIL must be a valid email address")
+        security = settings.get('SMTP_SECURITY', 'ssl' if port == 465 else 'starttls').lower()
+        if security not in ('starttls', 'ssl'):
+            raise ValueError("SMTP_SECURITY must be starttls or ssl")
+    except (OSError, configparser.Error) as exc:
+        raise ValueError("Unable to read email configuration: " + str(exc)) from exc
+
     return {
-        'sender_email': config['EMAIL']['SENDER_EMAIL'],
-        'smtp_server': config['EMAIL']['SMTP_SERVER'],
-        'smtp_port': int(config['EMAIL']['SMTP_PORT']),
+        'sender_email': settings['SENDER_EMAIL'],
+        'smtp_server': settings['SMTP_SERVER'],
+        'smtp_port': port,
+        'smtp_security': security,
     }
 
+
 def is_valid_email(email):
-    """Validate email format"""
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return bool(re.match(pattern, email))
+    """Validate plain email addresses, including rejecting header newlines."""
+    pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    return isinstance(email, str) and re.fullmatch(pattern, email) is not None
+
+
+def normalize_recipients(value, label, required=False):
+    """Accept an address or a list/tuple and validate every recipient."""
+    if value is None:
+        value = []
+    elif isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(label + " must be an address or a list of addresses")
+    if required and not value:
+        raise ValueError("At least one " + label + " address is required")
+    if any(not is_valid_email(address) for address in value):
+        raise ValueError("Invalid " + label + " email address")
+    return list(dict.fromkeys(value))
+
 
 def send_email(sender_email, password, receiver_email, subject, body, attachment_paths=None, cc=None, bcc=None):
+    """Send using verified TLS. Return True only if all recipients are accepted.
+
+    Recipients accept an address or a list/tuple. Requested attachments must all
+    be readable; failures abort before connecting. False can indicate partial
+    delivery, so inspect the logs before retrying to avoid duplicate messages.
     """
-    Send email with improved error handling and security
-    
-    Args:
-        sender_email (str): Sender's email address
-        password (str): Sender's email password or app password
-        receiver_email (str or list): Recipient email address(es)
-        subject (str): Email subject
-        body (str): Email body text
-        attachment_paths (list, optional): List of file paths to attach
-        cc (str or list, optional): CC recipients
-        bcc (str or list, optional): BCC recipients
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    # Validate email addresses
-    if not is_valid_email(sender_email):
-        logger.error(f"Invalid sender email format: {sender_email}")
-        return False
-    
-    # Convert single receiver to list for consistency
-    if isinstance(receiver_email, str):
-        receiver_email = [receiver_email]
-    
-    # Validate all receiver emails
-    for email in receiver_email:
-        if not is_valid_email(email):
-            logger.error(f"Invalid receiver email format: {email}")
-            return False
-    
     try:
-        # Load configuration
+        if not is_valid_email(sender_email):
+            raise ValueError("Invalid sender email address")
+        receivers = normalize_recipients(receiver_email, 'recipient', required=True)
+        cc = normalize_recipients(cc, 'CC')
+        bcc = normalize_recipients(bcc, 'BCC')
+        if not isinstance(subject, str) or any(char in subject for char in '\r\n'):
+            raise ValueError("Subject must be text without line breaks")
         config = load_config()
-        
-        # Set up the MIME
+
         msg = MIMEMultipart()
         msg['From'] = sender_email
-        msg['To'] = ', '.join(receiver_email)
+        msg['To'] = ', '.join(receivers)
         msg['Subject'] = subject
-        
-        # Add CC if provided
-        all_recipients = receiver_email.copy()
         if cc:
-            if isinstance(cc, str):
-                cc = [cc]
             msg['Cc'] = ', '.join(cc)
-            all_recipients.extend(cc)
-        
-        # Add BCC if provided (only to recipients list, not in headers)
-        if bcc:
-            if isinstance(bcc, str):
-                bcc = [bcc]
-            all_recipients.extend(bcc)
-        
-        # Attach the body with the msg instance
-        msg.attach(MIMEText(body, 'plain'))
-        
-        # Attachments
-        if attachment_paths:
-            if isinstance(attachment_paths, str):
-                attachment_paths = [attachment_paths]
-                
-            for attachment_path in attachment_paths:
-                # Convert to Path object for better path handling
-                path = Path(attachment_path)
-                
-                if not path.exists():
-                    logger.warning(f"Attachment not found: {attachment_path}")
-                    continue
-                    
-                try:
-                    with open(path, "rb") as attachment:
-                        part = MIMEBase('application', 'octet-stream')
-                        part.set_payload(attachment.read())
-                        
-                    encoders.encode_base64(part)
-                    
-                    # Add header to attachment based on file type
-                    filename = path.name
-                    content_type = "application/octet-stream"
-                    
-                    # Try to guess content type based on file extension
-                    if path.suffix.lower() in ['.pdf']:
-                        content_type = "application/pdf"
-                    elif path.suffix.lower() in ['.jpg', '.jpeg']:
-                        content_type = "image/jpeg"
-                    elif path.suffix.lower() in ['.png']:
-                        content_type = "image/png"
-                    elif path.suffix.lower() in ['.txt']:
-                        content_type = "text/plain"
-                    elif path.suffix.lower() in ['.html', '.htm']:
-                        content_type = "text/html"
-                    elif path.suffix.lower() in ['.doc', '.docx']:
-                        content_type = "application/msword"
-                    elif path.suffix.lower() in ['.xls', '.xlsx']:
-                        content_type = "application/vnd.ms-excel"
-                    elif path.suffix.lower() in ['.zip']:
-                        content_type = "application/zip"
-                        
-                    part.add_header(
-                        'Content-Disposition', 
-                        f'attachment; filename="{filename}"'
-                    )
-                    part.add_header('Content-Type', content_type)
-                    msg.attach(part)
-                    logger.info(f"Attached file: {path.name}")
-                except Exception as e:
-                    logger.error(f"Failed to attach {path}: {str(e)}")
-        
-        # Connect to the server and send the email
-        logger.info(f"Connecting to {config['smtp_server']}:{config['smtp_port']}...")
+        all_recipients = list(dict.fromkeys(receivers + cc + bcc))
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        if isinstance(attachment_paths, (str, os.PathLike)):
+            attachment_paths = [attachment_paths]
+        for attachment_path in attachment_paths or []:
+            path = Path(attachment_path)
+            content_type, encoding = mimetypes.guess_type(str(path))
+            if not content_type or encoding:
+                content_type = 'application/octet-stream'
+            maintype, subtype = content_type.split('/', 1)
+            part = MIMEBase(maintype, subtype)
+            # Read every requested file before connecting; never omit one silently.
+            part.set_payload(path.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment', filename=path.name)
+            msg.attach(part)
+
+        text = msg.as_string()
+        context = ssl.create_default_context()
+        logger.info("Connecting to %s:%s...", config['smtp_server'], config['smtp_port'])
+        use_ssl = config['smtp_security'] == 'ssl'
+        smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        kwargs = {'timeout': 30}
+        if use_ssl:
+            kwargs['context'] = context
+        with smtp_class(config['smtp_server'], config['smtp_port'], **kwargs) as server:
+            if not use_ssl:
+                server.starttls(context=context)
+            server.login(sender_email, password)
+            refused = server.sendmail(sender_email, all_recipients, text)
+            if refused:
+                logger.error("Partial delivery: %d recipient(s) refused. Other recipients may "
+                             "have received the message; do not retry the full list blindly.", len(refused))
+                return False
+        logger.info("Email accepted by the SMTP server for all recipients.")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        logger.error("Authentication failed. Check your email and app password.")
+    except Exception as exc:
+        logger.error("Failed to send email: %s", exc)
+    return False
+
+
+def prompt_recipients(prompt, required=False):
+    """Prompt again rather than silently dropping invalid recipients."""
+    while True:
+        value = input(prompt).strip()
+        addresses = [address.strip() for address in value.split(',')] if value else []
         try:
-            with smtplib.SMTP(config['smtp_server'], config['smtp_port'], timeout=30) as server:
-                server.starttls()  # Enable security
-                server.login(sender_email, password)
-                
-                text = msg.as_string()
-                server.sendmail(sender_email, all_recipients, text)
-                
-            logger.info("Email sent successfully!")
-            return True
-        except smtplib.SMTPAuthenticationError:
-            logger.error("Authentication failed. Please check your email and password.")
-            logger.info("For Gmail users: You may need to use an App Password. "
-                       "See https://support.google.com/accounts/answer/185833")
-            return False
-        except smtplib.SMTPException as e:
-            logger.error(f"SMTP error: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"Connection error: {str(e)}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Failed to send email. Error: {str(e)}")
-        return False
+            return normalize_recipients(addresses, 'recipient', required=required)
+        except ValueError as exc:
+            print(str(exc))
+
 
 def main():
     """Main function for running the script directly"""
@@ -216,45 +184,17 @@ def main():
         config = load_config()
     except Exception as e:
         logger.error(f"Failed to load configuration: {str(e)}")
-        return
+        return 1
     
     # Get email details
     sender_email = config['sender_email']
     print(f"Sender email: {sender_email}")
     
-    # Get recipient email(s)
-    while True:
-        receiver_email = input("Enter recipient email address(es) (comma-separated): ")
-        receiver_list = [email.strip() for email in receiver_email.split(',')]
-        valid = True
-        for email in receiver_list:
-            if not is_valid_email(email):
-                logger.error(f"Invalid email format: {email}")
-                valid = False
-        if valid:
-            break
-        print("Please enter valid email address(es)")
-    
-    # Get CC (optional)
-    cc_list = []
-    cc_input = input("Enter CC email address(es) (comma-separated, or press Enter to skip): ")
-    if cc_input.strip():
-        cc_list = [email.strip() for email in cc_input.split(',')]
-        for email in cc_list:
-            if not is_valid_email(email):
-                logger.warning(f"Invalid CC email format: {email} - will be skipped")
-                cc_list.remove(email)
-    
-    # Get BCC (optional)
-    bcc_list = []
-    bcc_input = input("Enter BCC email address(es) (comma-separated, or press Enter to skip): ")
-    if bcc_input.strip():
-        bcc_list = [email.strip() for email in bcc_input.split(',')]
-        for email in bcc_list:
-            if not is_valid_email(email):
-                logger.warning(f"Invalid BCC email format: {email} - will be skipped")
-                bcc_list.remove(email)
-    
+    receiver_list = prompt_recipients(
+        "Enter recipient email address(es) (comma-separated): ", required=True)
+    cc_list = prompt_recipients("Enter CC email address(es) (or Enter to skip): ")
+    bcc_list = prompt_recipients("Enter BCC email address(es) (or Enter to skip): ")
+
     # Get subject
     subject = input("Enter email subject: ")
     
@@ -280,8 +220,8 @@ def main():
         if not attachment:
             break
         path = Path(attachment)
-        if not path.exists():
-            logger.warning(f"File not found: {attachment}")
+        if not path.is_file():
+            logger.warning(f"Not a readable file path: {attachment}")
             continue
         attachments.append(str(path))
         logger.info(f"Added attachment: {path.name}")
@@ -302,9 +242,14 @@ def main():
     )
     
     if success:
-        logger.info("Email sent successfully!")
+        return 0
     else:
-        logger.error("Failed to send email. Please check the errors above.")
+        logger.error("Sending did not fully succeed. Check the errors above before retrying.")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        sys.exit(130)

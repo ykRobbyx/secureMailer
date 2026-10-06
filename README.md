@@ -18,7 +18,7 @@ A secure, feature-rich Python email sending utility that makes sending emails wi
 
 ```bash
 # Clone the repository
-git clone https://github.com/robbnxt/secureMailer.git
+git clone https://github.com/ykRobbyx/secureMailer.git
 cd secureMailer
 
 # Install dependencies (if you add any beyond standard library)
@@ -34,6 +34,8 @@ On first run, the script will create a default `email_config.ini` file. Edit it 
 SENDER_EMAIL = youremail@example.com
 SMTP_SERVER = smtp.gmail.com
 SMTP_PORT = 587
+# Optional: starttls or ssl (defaults to ssl on port 465, starttls otherwise)
+SMTP_SECURITY = starttls
 ```
 
 ## 🖥️ Usage
@@ -73,6 +75,29 @@ success = send_email(
 
 if success:
     print("Email sent successfully!")
+```
+
+## Reliable delivery
+
+- Every To, CC, and BCC address is validated before connecting. BCC addresses
+  appear only in the SMTP envelope, never in the message headers.
+- Connections verify the server certificate and hostname. Use `starttls` for
+  port 587 or `ssl` for implicit TLS on port 465; plaintext mode is not supported.
+- All requested attachments must be readable. A missing or unreadable file
+  stops sending instead of silently producing an incomplete email.
+- `send_email()` returns `True` when the SMTP server accepts all recipients.
+  This does not guarantee inbox delivery. `False` can mean partial delivery;
+  check the logs before retrying to avoid sending duplicate messages.
+- Configuration errors return `False` from `send_email()`; `load_config()` raises
+  `ValueError` and never terminates the calling process.
+- The CLI exits with status 0 on success, 1 on failure, or 130 on cancellation.
+
+## Tests
+
+Run the standard-library regression suite (no credentials or real email needed):
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
 ## 📌 Important Notes
